@@ -23,3 +23,23 @@ Guide audio can exist even when the source AAC is damaged; the current pipeline 
 ## Root-cause caution
 
 Similar zeroed regions across Program and ISO recordings suggest a shared recording/storage-path event, **not** proof of a specific component fault. Possible causes include the ATEM recording path, USB negotiation/link issues, SSD/controller/firmware behavior and filesystem/host interactions. Controlled testing on expendable media and device logs are needed to distinguish them. Do not conclude an SSD is defective solely from these sample statistics.
+
+## Multi-camera use (Mini Extreme ISO)
+
+The ISO recovery command supports CAM1..CAM8 and scans only the immediate children
+of one selected input directory. Filenames like `event CAM 8 01.mp4` are detected;
+missing cameras are allowed, and arbitrary recorded subsets retain their identities
+on separate Resolve video tracks (e.g. CAM1, CAM4 and CAM8 become V1, V2 and V3).
+Choose `--part 02` for later ATEM parts *only after confirming that the part belongs
+to the intended recording session*. Use explicit `--cam CAMn=/path` mapping for
+header-repaired inputs. Detecting the source is not evidence that it decodes.
+
+After rebuilding `ATEM_ISO_VERIFIED_WITH_AUDIO.xml`, always run the timecode
+repair; a source may have a real start timecode such as `18:03:58:07` even when
+a recovered MP4's first video sample starts at relative zero. A one-clip Resolve
+import test is the first acceptance gate. The PROGRAM overlay, if available, is
+placed on V(number_of_cameras+1), and a coverage CSV includes all camera sources.
+
+For a multi-session recording, do not concatenate `01` and `02` manifests without
+explicit timeline offsets and session boundaries. The automation intentionally
+fails closed on multiple filename prefixes or duplicate CAMn inputs.
