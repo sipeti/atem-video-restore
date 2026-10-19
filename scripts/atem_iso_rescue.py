@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Read-only source scanner and loss-minimizing ATEM ISO MP4 segment recovery.
 
-Inputs are fixed to the copies already made in ~/Desktop/ATEM_RESCUE.
+Camera inputs are selected explicitly or autodiscovered from one ATEM recording
+part in a folder containing verified copies. Supports CAM1..CAM8.
 Uses ffprobe's MP4 sample index, checks H.264/AVCC sample integrity,
 extracts only complete keyframe-aligned runs, then decodes each output
 as a check. CSV keeps original recording timestamps for each segment.
@@ -20,6 +21,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Optional
+from atem_multicam import select_sources
 
 GIB = 1024 ** 3
 ZERO_RUN = b"\0" * 4096
@@ -273,9 +275,15 @@ def write_csv(path, rows, columns):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", type=Path, default=Path.home() / "Desktop/ATEM_RESCUE")
-    ap.add_argument("--camera", choices=("1", "2", "both"), default="both")
-    ap.add_argument("--cam1", type=Path, help="CAM1 source MP4")
-    ap.add_argument("--cam2", type=Path, help="CAM2 source MP4")
+    ap.add_argument("--camera", default="auto",
+                    help="auto/all, both, or comma-separated camera IDs (e.g. 1,3,8)")
+    ap.add_argument("--input-dir", type=Path,
+                    help="directory of ATEM CAM 1..8 XX.mp4 copies for automatic detection")
+    ap.add_argument("--part", default="01", help="source recording part/session suffix, default 01")
+    ap.add_argument("--cam", action="append", default=[],
+                    help="explicit source override CAMn=PATH, repeat for CAM1..CAM8")
+    ap.add_argument("--cam1", type=Path, help="legacy explicit CAM1 source MP4")
+    ap.add_argument("--cam2", type=Path, help="legacy explicit CAM2 source MP4")
     ap.add_argument("--scan-only", action="store_true", help="scan and CSV only, no video extraction")
     ap.add_argument("--min-seconds", type=float, default=1., help="minimum clip length")
     ap.add_argument("--max-seconds", type=float, default=180., help="maximum clip length")
@@ -284,9 +292,13 @@ def main():
     ap.add_argument("--no-verify", action="store_true", help="skip full decode verification")
     args = ap.parse_args()
     root = args.root.expanduser().resolve()
-    copies = root / "forrasmasolat"
     dest = root / "RECOVERED"
-    for report in ("recovery_manifest.csv", "scan_summary.csv", "CAM1_suspect_packets.csv", "CAM2_suspect_packets.csv"):
+    sources = select_sources(root, camera=args.camera, input_dir=args.input_dir,
+                             part=args.part, mappings=args.cam,
+                             cam1=args.cam1, cam2=args.cam2)
+    wanted = list(sources)
+    for report in ("recovery_manifest.csv", "scan_summary.csv") + tuple(
+            "CAM%s_suspect_packets.csv" % cam for cam in wanted):
         if (dest / report).exists():
             sys.exit("ERROR: existing report; choose fresh --root: " + report)
     dest.mkdir(exist_ok=True, parents=True)
@@ -296,17 +308,6 @@ def main():
     if args.min_seconds < 0 or args.max_seconds <= 0:
         sys.exit("ERROR: Invalid duration options")
 
-    sources = {"1": args.cam1, "2": args.cam2}
-    wanted = ["1", "2"] if args.camera == "both" else [args.camera]
-    for k in wanted:
-        if sources[k] is None:
-            sys.exit("ERROR: --cam%s required" % k)
-        sources[k] = sources[k].expanduser().resolve()
-    if any(not sources[k].is_file() for k in wanted):
-        for k in wanted:
-            if not sources[k].is_file():
-                print("MISSING INPUT:", sources[k], file=sys.stderr)
-        sys.exit(2)
 
     manifest_rows = []
     summary_rows = []
@@ -409,6 +410,6 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrupted. Existing outputs and sources were not deleted.", file=sys.stderr)
         sys.exit(130)
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         print(f"\nERROR: {exc}", file=sys.stderr)
         sys.exit(1)

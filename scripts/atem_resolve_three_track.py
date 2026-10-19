@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Add verified ATEM PROGRAM rescue clips to a known-working two-camera Resolve FCP7 XML.
+"""Add verified PROGRAM clips above 1..8 timecode-fixed ATEM ISO camera tracks.
 
-Non-destructive: reads the already timecode-fixed dual-camera XML, the
+Non-destructive: reads the already timecode-fixed ISO XML, the
 RECOVERED_PROGRAM/recovery_manifest.csv and each PROGRAM clip (via ffprobe).
-Creates three separate XMLs and a coverage CSV under RECOVERED. Never edits
+Creates a single-clip trial, two full XMLs and a coverage CSV. Never edits
 source MP4, source manifest, original XML, or an existing Resolve project.
 
 Expected layout:
@@ -70,11 +70,12 @@ def read_xml(path):
     tree = ET.parse(str(path))
     root = tree.getroot()
     tracks = root.findall("./sequence/media/video/track")
-    if len(tracks) != 2:
-        raise ValueError("Expected 2 original video tracks; found %s" % len(tracks))
+    if not 1 <= len(tracks) <= 8:
+        raise ValueError("Expected 1..8 original camera video tracks; found %s" % len(tracks))
     counts = [len(track.findall("clipitem")) for track in tracks]
     if not all(n > 0 for n in counts):
-        raise ValueError("Both camera tracks must have clips: %s" % counts)
+        raise ValueError("All camera tracks must have at least one clip: %s" % counts)
+    camera_labels(root)  # distinct, well-formed track mappings only
     if root.findtext("./sequence/rate/timebase") != "25":
         raise ValueError("Original XML frame rate is not 25fps")
     if int(root.findtext("./sequence/duration", "0")) <= 0:
@@ -94,8 +95,27 @@ def read_xml(path):
                 raise ValueError("Original XML has an unsupported media path")
             actual = Path(unquote(parsed.path))
             if not actual.is_file():
-                raise ValueError("Original CAM%d media is missing: %s" % (i + 1, actual))
+                raise ValueError("Original camera media is missing: %s" % actual)
     return root
+
+
+def camera_labels(root):
+    tracks = root.findall("./sequence/media/video/track")
+    labels = []
+    for track in tracks:
+        names = [clip.findtext("name") or "" for clip in track.findall("clipitem")]
+        matches = [re.match(r"CAM([1-8])_", name, re.I) for name in names]
+        if not names or any(m is None for m in matches):
+            raise ValueError("Cannot infer CAM1..CAM8 identity from a video track")
+        cams = {m.group(1) for m in matches}
+        if len(cams) != 1:
+            raise ValueError("Multiple cameras were mixed into one track")
+        labels.append("CAM" + cams.pop())
+    if len(labels) != len(set(labels)):
+        raise ValueError("Duplicate camera tracks in original XML")
+    if len(labels) != len(tracks) or len(labels) > 8:
+        raise ValueError("Invalid camera track count")
+    return labels
 
 
 def get_probe(path):
@@ -257,6 +277,7 @@ def add_program_track(root, program, *, with_audio):
     video = media.find("video")
     if video is None:
         raise ValueError("Original XML missing video section")
+    labels = camera_labels(root)
     track = make(video, "track")
     for i, entry in enumerate(program, 1):
         make_clip(track, entry, i, with_audio=with_audio)
@@ -278,9 +299,11 @@ def add_program_track(root, program, *, with_audio):
         print("  extra PROGRAM audio clips: %d (NOT separately decode-verified)" % count)
     seq = root.find("./sequence")
     seq.set("id", "sequence-atem-rescue-program")
-    name = "ATEM ISO RESCUE - CAM1 V1 CAM2 V2 PROGRAM V3"
+    name = "ATEM ISO RESCUE - " + " ".join(
+        "%s V%d" % (label, i) for i, label in enumerate(labels, 1))
+    name += " PROGRAM V%d" % (len(labels) + 1)
     if with_audio:
-        name += " + PROGRAM AUDIO A3"
+        name += " + PROGRAM AUDIO A%d" % (len(labels) + 1)
     make_name = seq.find("name")
     if make_name is None:
         make_name = ET.Element("name")
@@ -297,11 +320,14 @@ def write_xml(root, path):
     with path.open("xb") as f:
         f.write(raw)
     parsed = ET.parse(str(path)).getroot()
-    assert len(parsed.findall("./sequence/media/video/track")) == 3
+    expected = len(root.findall("./sequence/media/video/track"))
+    if len(parsed.findall("./sequence/media/video/track")) != expected:
+        raise ValueError("PROGRAM XML track count changed while writing")
 
 
 def coverage_csv(path, base, program, timeline_frames):
     tracks = base.findall("./sequence/media/video/track")
+    labels = camera_labels(base) + ["PROGRAM"]
     source_spans = []
     for track in tracks:
         source_spans.append([(int(x.findtext("start")), int(x.findtext("end")))
@@ -321,21 +347,21 @@ def coverage_csv(path, base, program, timeline_frames):
             spans.append((start, end, flags))
     with path.open("x", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["start_frame", "end_frame", "start_s", "end_s", "duration_s",
-                    "CAM1", "CAM2", "PROGRAM", "sources_available"])
+        w.writerow(["start_frame", "end_frame", "start_s", "end_s", "duration_s"]
+                   + labels + ["sources_available"])
         for start, end, flags in spans:
             w.writerow([start, end, "%.3f" % (start / FPS), "%.3f" % (end / FPS),
                         "%.3f" % ((end-start) / FPS)] + list(map(int, flags)) + [sum(flags)])
     time_cam = [sum(b-a for a,b in intervals) for intervals in source_spans]
-    union_cams = sum(b-a for a,b,flags in spans if flags[0] or flags[1])
+    union_cams = sum(b-a for a,b,flags in spans if any(flags[:-1]))
     union_all = sum(b-a for a,b,flags in spans if any(flags))
-    for label, count in zip(("CAM1", "CAM2", "PROGRAM"), time_cam):
+    for label, intervals in zip(labels, source_spans):
         print("  %-7s: %d clips, %.2f min" %
-              (label, len(source_spans[("CAM1", "CAM2", "PROGRAM").index(label)]), count / FPS / 60))
-    print("  CAM1+CAM2 coverage: %.2f min" % (union_cams / FPS / 60))
-    print("  Added by PROGRAM:  %.2f sec" % ((union_all-union_cams)/FPS))
-    print("  3-source coverage: %.2f min (%.2f%%)" %
-          (union_all/FPS/60, 100*union_all/timeline_frames))
+              (label, len(intervals), sum(b-a for a,b in intervals) / FPS / 60))
+    print("  ISO cameras coverage: %.2f min" % (union_cams / FPS / 60))
+    print("  Added by PROGRAM:     %.2f sec" % ((union_all-union_cams)/FPS))
+    print("  %d-source coverage:   %.2f min (%.2f%%)" %
+          (len(labels), union_all/FPS/60, 100*union_all/timeline_frames))
     print("  Still missing:     %.2f sec" % ((timeline_frames-union_all)/FPS))
     return spans
 
@@ -344,15 +370,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--root", type=Path,
                     default=Path.home() / "Desktop" / "ATEM_RESCUE")
+    ap.add_argument("--xml", type=Path, help="existing timecode-fixed camera timeline XML")
     args = ap.parse_args()
     root = args.root.expanduser().resolve()
-    existing = root / "RECOVERED" / "ATEM_ISO_VERIFIED_WITH_AUDIO_TCFIX.xml"
+    existing = args.xml.expanduser().resolve() if args.xml else root / "RECOVERED" / "ATEM_ISO_VERIFIED_WITH_AUDIO_TCFIX.xml"
     program_root = root / "RECOVERED_PROGRAM"
     outdir = root / "RECOVERED"
     oneclip = outdir / "ATEM_ISO_PROGRAM_ONECLIP_TCFIX.xml"
-    video = outdir / "ATEM_ISO_CAM1_CAM2_PROGRAM_V3_TCFIX.xml"
-    audio = outdir / "ATEM_ISO_CAM1_CAM2_PROGRAM_V3_WITH_AUDIO_TCFIX.xml"
-    report = outdir / "ATEM_ISO_THREE_SOURCE_COVERAGE.csv"
+    video = outdir / "ATEM_ISO_WITH_PROGRAM_TCFIX.xml"
+    audio = outdir / "ATEM_ISO_WITH_PROGRAM_AUDIO_TCFIX.xml"
+    report = outdir / "ATEM_ISO_MULTI_SOURCE_COVERAGE.csv"
     targets = (oneclip, video, audio, report)
     for target in targets:
         if target.exists():
@@ -361,6 +388,7 @@ def main():
         raise ValueError("ffprobe missing (brew install ffmpeg)")
     print("Known-good TCFIX XML:", existing)
     original = read_xml(existing)
+    camera_count = len(camera_labels(original))
     timeline_frames = int(original.findtext("./sequence/duration"))
     print("PROGRAM manifest:", program_root / "recovery_manifest.csv")
     program = load_program(program_root, timeline_frames)
@@ -382,7 +410,7 @@ def main():
     small = copy.deepcopy(t)
     for track_index, track in enumerate(small.findall("./sequence/media/video/track")):
         for clip_index, clip in enumerate(list(track.findall("clipitem"))):
-            if track_index == 2 and clip_index == 0:
+            if track_index == camera_count and clip_index == 0:
                 continue  # Only the first PROGRAM segment remains in the trial XML.
             track.remove(clip)
     for track in small.findall("./sequence/media/audio/track"):
@@ -392,7 +420,7 @@ def main():
 
     print("\n=== XML READY ===")
     print("First test one PROGRAM clip:", oneclip)
-    print("Full 3-video-track XML:    ", video)
+    print("Full %d-video-track XML:    " % (camera_count + 1), video)
     print("With PROGRAM guide audio:  ", audio)
     print("Coverage detail CSV:       ", report)
     print("All original XML/CSV/MP4 files left unchanged.")

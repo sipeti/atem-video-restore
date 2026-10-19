@@ -2,11 +2,11 @@
 """Generate DaVinci Resolve-compatible FCP7 XML timelines from ATEM ISO Rescue.
 
 Reads ~/Desktop/ATEM_RESCUE/RECOVERED/recovery_manifest.csv and references
-already-extracted clips in CAM1/ and CAM2/. Does not change any media.
+already-extracted clips in CAM1/ ... CAM8/. Does not change any media.
 
 Outputs:
-  ATEM_ISO_VERIFIED_VIDEO.xml        V1 CAM1, V2 CAM2 (decode-pass only)
-  ATEM_ISO_VERIFIED_WITH_AUDIO.xml   plus guide audio tracks A1 CAM1, A2 CAM2
+  ATEM_ISO_VERIFIED_VIDEO.xml        one track per discovered CAM1..CAM8 (decode-pass only)
+  ATEM_ISO_VERIFIED_WITH_AUDIO.xml   plus one guide audio track per camera
   ATEM_ISO_REVIEW_ALL.xml            all existing extracted clips (unchecked ones
                                     labelled REVIEW); video only
   ATEM_ISO_TIMELINE_REPORT.csv       imported/skipped clips and placement
@@ -27,6 +27,7 @@ import sys
 from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import quote
 import xml.etree.ElementTree as ET
+from atem_multicam import CAMERA_IDS, camera_ids
 
 FPS = 25
 VALID_STATUSES = {"VIDEO_DECODE_PASS"}
@@ -116,8 +117,8 @@ def read_manifest(root: Path) -> tuple[list[dict], list[str]]:
     warnings = []
     for idx, row in enumerate(rows, 1):
         cam = row["camera"].strip()
-        if cam not in {"1", "2"}:
-            warnings.append(f"Row {idx}: unknown camera, skipping")
+        if cam not in CAMERA_IDS:
+            warnings.append(f"Row {idx}: unknown camera {cam!r}, skipping")
             continue
         rel = Path(row["output"])
         if rel.is_absolute() or ".." in rel.parts:
@@ -174,7 +175,7 @@ def prepare_entries(all_rows: list[dict], allowed: set[str], *, cache: dict,
     # Prevent overlapping clips within a camera track; if rounded intervals collide,
     # trim the later clip's head, keeping the original timeline mapping intact.
     result = []
-    for cam in ("1", "2"):
+    for cam in camera_ids(picked):
         prev_end = 0
         for e in sorted((e for e in picked if e["camera"] == cam),
                         key=lambda e: (e["start"], e["row"])):
@@ -278,10 +279,13 @@ def make_timeline(path: Path, entries: list[dict], *, with_audio: bool,
     media = make(seq, "media")
     video = make(media, "video")
     add_video_format(video)
+    cameras = camera_ids(entries)
+    if not cameras:
+        raise ValueError("No camera tracks to export")
     camera_entries = {cam: [e for e in entries if e["camera"] == cam]
-                      for cam in ("1", "2")}
+                      for cam in cameras}
     file_ids = {}
-    for cam in ("1", "2"):
+    for cam in cameras:
         track = make(video, "track")
         for ix, entry in enumerate(camera_entries[cam], start=1):
             fid = f"file_cam{cam}_{ix}"
@@ -300,7 +304,7 @@ def make_timeline(path: Path, entries: list[dict], *, with_audio: bool,
         outgroup = make(outputs, "group")
         make(outgroup, "index", 1)
         make(outgroup, "numchannels", 2)
-        for cam in ("1", "2"):
+        for cam in cameras:
             track = make(audio, "track")
             for ix, entry in enumerate(camera_entries[cam], 1):
                 if not entry["meta"]["audio"]:
@@ -320,9 +324,9 @@ def make_timeline(path: Path, entries: list[dict], *, with_audio: bool,
         raise ValueError("Unexpected XML declaration")
     body = body.replace(marker, marker + b'<!DOCTYPE xmeml>\n', 1)
     path.write_bytes(body)
-    # Check that the generated XML parses and has exactly 2 video tracks.
+    # The XML has precisely one video track for each discovered camera.
     verify = ET.parse(path)
-    if len(verify.findall("./sequence/media/video/track")) != 2:
+    if len(verify.findall("./sequence/media/video/track")) != len(cameras):
         raise ValueError("Generated XML video track count incorrect")
 
 
@@ -355,14 +359,16 @@ def main() -> int:
     for dest in (verified_video, verified_av, review_xml, report_path):
         if dest.exists():
             raise ValueError("Output exists; refusing overwrite: " + str(dest))
+    labels = " ".join("CAM%s V%d" % (cam, i) for i, cam in
+                      enumerate(camera_ids(pass_entries), 1))
     make_timeline(verified_video, pass_entries, with_audio=False,
-                  name="ATEM ISO RESCUE - VERIFIED VIDEO - CAM1 V1 CAM2 V2",
+                  name="ATEM ISO RESCUE - VERIFIED VIDEO - " + labels,
                   duration=duration)
     make_timeline(verified_av, pass_entries, with_audio=True,
-                  name="ATEM ISO RESCUE - VERIFIED WITH AUDIO - CAM1 V1 CAM2 V2",
+                  name="ATEM ISO RESCUE - VERIFIED WITH AUDIO - " + labels,
                   duration=duration)
     make_timeline(review_xml, review_entries, with_audio=False,
-                  name="ATEM ISO RESCUE - ALL RECOVERED REVIEW - CAM1 V1 CAM2 V2",
+                  name="ATEM ISO RESCUE - ALL RECOVERED REVIEW",
                   duration=duration)
     with report_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["timeline", "camera", "filename", "original_start_frame",
@@ -374,7 +380,7 @@ def main() -> int:
         print("WARNING:", message)
     print("\n=== XML TIMELINES READY ===")
     print(f"Timeline: {duration / FPS:.3f} seconds ({duration} frames) at {FPS} fps")
-    for cam in ("1", "2"):
+    for cam in camera_ids(pass_entries):
         clips = [e for e in pass_entries if e["camera"] == cam]
         seconds = sum(e["length"] for e in clips) / FPS
         print(f"Verified CAM {cam}: {len(clips)} clips, {seconds / 60:.2f} min (individual clip sum)")
