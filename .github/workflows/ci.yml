@@ -1,0 +1,21 @@
+name: Recovery toolkit checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Check syntax
+        run: python -m compileall -q scripts tests
+      - name: Unit and synthetic-media tests
+        run: python -m unittest discover -s tests -v
