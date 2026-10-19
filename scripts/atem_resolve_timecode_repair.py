@@ -3,7 +3,7 @@
 
 Requires ffprobe. Reads existing verified XML and recovered MP4s on this Mac.
 Writes new *_TCFIX.xml and *_TIMECODE_DIAG.csv alongside original XML.
-Also writes a CAM1 one-clip XML test (not an additional video copy).
+Also writes a one-clip XML test for the first available camera.
 Never modifies video, existing XML, or Resolve project.
 """
 import argparse
@@ -16,6 +16,7 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from urllib.parse import unquote, urlsplit, quote
+from atem_multicam import CAMERA_IDS
 
 FPS = 25
 TC_RX = re.compile(r'^([0-9]{2}):([0-9]{2}):([0-9]{2})[:;]([0-9]{2})$')
@@ -90,7 +91,7 @@ def get_source_path(file_node, root_dir):
     name = file_node.findtext('name')
     if not name:
         raise ValueError('File not found and no name')
-    candidates = [root_dir / 'CAM1' / name, root_dir / 'CAM2' / name]
+    candidates = [root_dir / ('CAM' + cam) / name for cam in CAMERA_IDS]
     exists = [p for p in candidates if p.is_file()]
     if len(exists) == 1:
         return exists[0], True
@@ -127,8 +128,8 @@ def main():
     tree = ET.parse(str(xml_path))
     xml_root = tree.getroot()
     vidtracks = xml_root.findall('./sequence/media/video/track')
-    if len(vidtracks) != 2:
-        raise ValueError('Expected two video tracks, found %s' % len(vidtracks))
+    if not 1 <= len(vidtracks) <= 8:
+        raise ValueError('Expected 1..8 camera video tracks, found %s' % len(vidtracks))
     # Source-clip file elements are complete only once per file id. Audio usually references the id.
     files = {node.get('id'): node for node in xml_root.findall('.//file') if node.find('pathurl') is not None}
     if not files:
@@ -148,7 +149,8 @@ def main():
     errors = []
     for ix, (fid, filenode) in enumerate(files.items(), 1):
         name = filenode.findtext('name') or ''
-        camera = '1' if name.startswith('CAM1_') else ('2' if name.startswith('CAM2_') else '?')
+        match = re.match(r'CAM([1-8])_', name, re.I)
+        camera = match.group(1) if match else '?'
         info = {'camera': camera, 'filename': name, 'file_id': fid, 'media_path': '',
                 'path_repaired': '', 'media_timecode': '', 'media_tc_frame': '',
                 'video_start_time': '', 'media_nb_frames': '', 'media_duration_frames': '',
@@ -187,7 +189,12 @@ def main():
             print('Probed %s/%s clips' % (ix, len(files)), flush=True)
     report = xml_path.with_name(xml_path.stem + '_TIMECODE_DIAG.csv')
     new_xml = xml_path.with_name(xml_path.stem + '_TCFIX.xml')
-    trial = xml_path.with_name('ATEM_ISO_CAM1_ONECLIP_TCFIX.xml')
+    first_clip = next((x for t in vidtracks for x in t.findall('clipitem')), None)
+    if first_clip is None:
+        raise ValueError('No video clip to test')
+    matched = re.match(r'CAM([1-8])_', first_clip.findtext('name') or '', re.I)
+    first_camera = matched.group(1) if matched else 'UNKNOWN'
+    trial = xml_path.with_name('ATEM_ISO_CAM%s_ONECLIP_TCFIX.xml' % first_camera)
     for target in (report, new_xml, trial):
         if target.exists():
             raise ValueError('Output exists; refusing overwrite: ' + str(target))
@@ -201,22 +208,22 @@ def main():
             print('  ' + e)
         return 2
     write_xml(xml_root, new_xml)
-    # Standalone 1-clip CAM1 check, minimizes Resolve trial/error.
+    # Standalone first camera clip, while keeping original track positions.
     tiny = copy.deepcopy(xml_root)
     vid = tiny.findall('./sequence/media/video/track')
-    if vid and len(vid) == 2:
-        c1s = vid[0].findall('clipitem')
-        for i, node in enumerate(c1s):
-            if i > 0:
-                vid[0].remove(node)
-        for node in vid[1].findall('clipitem'):
-            vid[1].remove(node)
+    preserved = False
+    for track in vid:
+        for node in list(track.findall('clipitem')):
+            if not preserved:
+                preserved = True
+                continue
+            track.remove(node)
     for atrack in tiny.findall('./sequence/media/audio/track'):
         for node in atrack.findall('clipitem'):
             atrack.remove(node)
     write_xml(tiny, trial)
     print('\n=== SOURCE TC DIAG ===')
-    for camera in ('1', '2'):
+    for camera in sorted({r['camera'] for r in rows if r['camera'] in CAMERA_IDS}, key=int):
         cr = [r for r in rows if r['camera'] == camera]
         times = sorted(set(r['media_timecode'] or 'NONE' for r in cr))
         issues = [r for r in cr if r['issue']]
