@@ -67,10 +67,11 @@ For ordinary ATEM exports, place **verified copies** of a single session's video
 
 ```bash
 python3 scripts/atem_iso_rescue.py \
-  --root "$JOB" --input-dir "$JOB/forrasmasolat" --camera auto --scan-only
-# Review the scan-only report, then run with a new, fresh --root for extraction:
+  --root "$JOB/scan_preview" --input-dir "$JOB/forrasmasolat" --camera auto --scan-only
+# Inspect $JOB/scan_preview/RECOVERED/scan_summary.csv.
+# Then extract into the original (still-unused) job root:
 python3 scripts/atem_iso_rescue.py \
-  --root "$JOB_EXTRACT" --input-dir "$JOB/forrasmasolat" --camera auto
+  --root "$JOB" --input-dir "$JOB/forrasmasolat" --camera auto
 ```
 
 Autodiscovery selects CAM1 through CAM8 **only for `01` (default)**, with a single shared recording filename prefix. Use `--part 02` for a different physical recording part, but **do not combine multiple ATEM start/stop sessions in one timeline**: recover them separately. A missing camera number is fine; an ambiguous or mixed recording is a hard error.
